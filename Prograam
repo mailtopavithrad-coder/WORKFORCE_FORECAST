@@ -1,0 +1,375 @@
+
+import os
+import numpy as np
+import pandas as pd
+
+SOURCE_FILE = r"C:\Users\pavit\Downloads\employee_records (1).csv"
+OUTPUT_FOLDER = r"C:\Users\pavit\Downloads\workforce_forecast_output"
+FORECAST_MONTHS = 12
+SIMULATIONS = 4000
+
+np.random.seed(42)
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+df = pd.read_csv(SOURCE_FILE)
+
+df["Joining_Date"] = pd.to_datetime(df["Joining_Date"], errors="coerce")
+df["Salary"] = pd.to_numeric(df["Salary"], errors="coerce")
+df["Age"] = pd.to_numeric(df["Age"], errors="coerce")
+
+required_columns = [
+    "Employee_ID",
+    "Department",
+    "Position",
+    "Joining_Date",
+    "Salary",
+    "Age"
+]
+
+df = df.dropna(subset=required_columns).copy()
+df["Month"] = df["Joining_Date"].dt.to_period("M").dt.to_timestamp()
+
+first_month = df["Month"].min()
+latest_month = df["Month"].max()
+
+all_months = pd.date_range(
+    start=first_month,
+    end=latest_month,
+    freq="MS"
+)
+
+df["Tenure_Years"] = (
+    latest_month - df["Joining_Date"]
+).dt.days / 365.25
+
+department_q1_salary = df.groupby("Department")["Salary"].transform(
+    lambda x: x.quantile(0.25)
+)
+
+df["Annual_Attrition_Risk"] = 0.08
+df.loc[df["Age"] <= 30, "Annual_Attrition_Risk"] += 0.025
+df.loc[df["Age"] >= 50, "Annual_Attrition_Risk"] += 0.010
+df.loc[df["Tenure_Years"] < 1, "Annual_Attrition_Risk"] += 0.030
+
+df.loc[
+    (df["Tenure_Years"] >= 1) &
+    (df["Tenure_Years"] < 3),
+    "Annual_Attrition_Risk"
+] += 0.012
+
+df.loc[
+    df["Salary"] <= department_q1_salary,
+    "Annual_Attrition_Risk"
+] += 0.015
+
+df["Annual_Attrition_Risk"] = df[
+    "Annual_Attrition_Risk"
+].clip(lower=0.05, upper=0.24)
+
+department_history_list = []
+
+for department in df["Department"].unique():
+    department_data = df[df["Department"] == department]
+
+    monthly_hires = (
+        department_data.groupby("Month")
+        .size()
+        .reindex(all_months, fill_value=0)
+    )
+
+    department_history = pd.DataFrame({
+        "Month": all_months,
+        "Department": department,
+        "New_Hires": monthly_hires.values,
+        "Headcount": monthly_hires.cumsum().values
+    })
+
+    department_history["Monthly_Growth_Rate"] = (
+        department_history["Headcount"]
+        .pct_change()
+        .replace([np.inf, -np.inf], np.nan)
+    )
+
+    department_history_list.append(department_history)
+
+department_history = pd.concat(
+    department_history_list,
+    ignore_index=True
+)
+
+department_history.to_csv(
+    os.path.join(
+        OUTPUT_FOLDER,
+        "01_historical_department_headcount.csv"
+    ),
+    index=False
+)
+
+role_history_list = []
+
+for (department, position), group in df.groupby(
+    ["Department", "Position"]
+):
+    monthly_hires = (
+        group.groupby("Month")
+        .size()
+        .reindex(all_months, fill_value=0)
+    )
+
+    role_history = pd.DataFrame({
+        "Month": all_months,
+        "Department": department,
+        "Position": position,
+        "New_Hires": monthly_hires.values,
+        "Headcount": monthly_hires.cumsum().values
+    })
+
+    role_history_list.append(role_history)
+
+role_history = pd.concat(role_history_list, ignore_index=True)
+
+role_history.to_csv(
+    os.path.join(
+        OUTPUT_FOLDER,
+        "02_historical_role_headcount.csv"
+    ),
+    index=False
+)
+
+def forecast_staffing(group_data, group_name, group_type):
+    current_headcount = len(group_data)
+
+    annual_attrition = group_data[
+        "Annual_Attrition_Risk"
+    ].mean()
+
+    monthly_attrition = annual_attrition / 12
+
+    monthly_hires = (
+        group_data.groupby("Month")
+        .size()
+        .reindex(all_months, fill_value=0)
+    )
+
+    recent_hires = monthly_hires.tail(12).mean()
+
+    if len(monthly_hires) >= 24:
+        previous_hires = monthly_hires.iloc[-24:-12].mean()
+    else:
+        previous_hires = recent_hires
+
+    if pd.isna(previous_hires) or previous_hires == 0:
+        hiring_momentum = 0
+    else:
+        hiring_momentum = (recent_hires / previous_hires) - 1
+
+    monthly_demand_growth = 0.006 + (
+        0.002 * hiring_momentum
+    )
+
+    monthly_demand_growth = min(
+        max(monthly_demand_growth, 0.003),
+        0.009
+    )
+
+    forecast_dates = pd.date_range(
+        latest_month + pd.offsets.MonthBegin(1),
+        periods=FORECAST_MONTHS,
+        freq="MS"
+    )
+
+    target_headcount = float(current_headcount)
+
+    simulation_supply = np.full(
+        SIMULATIONS,
+        current_headcount,
+        dtype=int
+    )
+
+    forecast_results = []
+
+    for month_number, forecast_month in enumerate(
+        forecast_dates,
+        start=1
+    ):
+        target_headcount = target_headcount * (
+            1 + monthly_demand_growth
+        )
+
+        simulated_exits = np.random.binomial(
+            simulation_supply,
+            monthly_attrition
+        )
+
+        simulation_supply = simulation_supply - simulated_exits
+
+        expected_supply = simulation_supply.mean()
+        supply_p10 = np.percentile(simulation_supply, 10)
+        supply_p90 = np.percentile(simulation_supply, 90)
+
+        expected_exits = (
+            current_headcount *
+            (1 - (1 - monthly_attrition) ** month_number)
+        ) - (
+            current_headcount *
+            (1 - (1 - monthly_attrition) ** (
+                month_number - 1
+            ))
+        )
+
+        recommended_hires = max(
+            0,
+            target_headcount - expected_supply
+        )
+
+        high_risk_hiring_need = max(
+            0,
+            target_headcount - supply_p10
+        )
+
+        forecast_results.append({
+            "Forecast_Month": forecast_month,
+            "Forecast_Period": forecast_month.strftime(
+                "%b-%Y"
+            ),
+            "Grouping": group_type,
+            "Group": group_name,
+            "Current_Headcount": current_headcount,
+            "Target_Headcount": round(target_headcount),
+            "Expected_Exits": round(expected_exits, 1),
+            "No_Intervention_Supply": round(expected_supply),
+            "Supply_P10": round(supply_p10),
+            "Supply_P90": round(supply_p90),
+            "Recommended_Hires": int(
+                np.ceil(recommended_hires)
+            ),
+            "High_Risk_Hiring_Need": int(
+                np.ceil(high_risk_hiring_need)
+            ),
+            "Annual_Attrition_Scenario": round(
+                annual_attrition,
+                4
+            ),
+            "Monthly_Demand_Growth_Scenario": round(
+                monthly_demand_growth,
+                4
+            ),
+            "Recent_Avg_Monthly_Hires": round(
+                recent_hires,
+                1
+            )
+        })
+
+    return forecast_results
+
+department_forecast_list = []
+
+for department, group in df.groupby("Department"):
+    department_forecast_list.extend(
+        forecast_staffing(
+            group,
+            department,
+            "Department"
+        )
+    )
+
+department_forecast = pd.DataFrame(
+    department_forecast_list
+)
+
+department_forecast.to_csv(
+    os.path.join(
+        OUTPUT_FOLDER,
+        "03_department_forecast_12_months.csv"
+    ),
+    index=False
+)
+
+role_forecast_list = []
+
+for position, group in df.groupby("Position"):
+    role_forecast_list.extend(
+        forecast_staffing(
+            group,
+            position,
+            "Position"
+        )
+    )
+
+role_forecast = pd.DataFrame(role_forecast_list)
+
+role_forecast.to_csv(
+    os.path.join(
+        OUTPUT_FOLDER,
+        "04_role_forecast_12_months.csv"
+    ),
+    index=False
+)
+
+final_forecast_month = department_forecast[
+    department_forecast["Forecast_Month"] ==
+    department_forecast["Forecast_Month"].max()
+].copy()
+
+executive_summary = final_forecast_month[
+    [
+        "Group",
+        "Current_Headcount",
+        "Target_Headcount",
+        "Expected_Exits",
+        "Recommended_Hires",
+        "High_Risk_Hiring_Need",
+        "Annual_Attrition_Scenario"
+    ]
+].rename(columns={
+    "Group": "Department"
+})
+
+executive_summary["Priority"] = pd.cut(
+    executive_summary["Recommended_Hires"],
+    bins=[-1, 25, 75, float("inf")],
+    labels=["Monitor", "Medium", "High"]
+)
+
+executive_summary = executive_summary.sort_values(
+    by="Recommended_Hires",
+    ascending=False
+)
+
+executive_summary.to_csv(
+    os.path.join(
+        OUTPUT_FOLDER,
+        "05_executive_staffing_priorities.csv"
+    ),
+    index=False
+)
+
+retention_risk_table = df[
+    [
+        "Employee_ID",
+        "Employee_Name",
+        "Department",
+        "Position",
+        "Age",
+        "Salary",
+        "Joining_Date",
+        "Tenure_Years",
+        "Annual_Attrition_Risk"
+    ]
+].copy()
+
+retention_risk_table.to_csv(
+    os.path.join(
+        OUTPUT_FOLDER,
+        "06_employee_retention_risk_proxy.csv"
+    ),
+    index=False
+)
+
+print("\nWORKFORCE FORECAST COMPLETED SUCCESSFULLY\n")
+
+print(
+    executive_summary.head(10).to_string(
+        index=False
+    )
+)
