@@ -1,0 +1,9 @@
+WORKFORCE FORECAST COMPLETED SUCCESSFULLY
+
+ Department  Current_Headcount  Target_Headcount  Expected_Exits  Recommended_Hires  High_Risk_Hiring_Need  Annual_Attrition_Scenario Priority
+    Support               4990              5350            37.2                828                    854                     0.0978     High
+         HR               4976              5338            37.1                828                    855                     0.0979     High
+Engineering               5070              5424            37.7                827                    855                     0.0976     High
+      Sales               5019              5374            37.3                824                    850                     0.0976     High
+    Finance               4938              5300            36.7                823                    849                     0.0976     High
+  Marketing               5007              5361            37.2                822                    848                     0.0976     High
